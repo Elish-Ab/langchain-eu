@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from langchain_core.exceptions import OutputParserException
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel  # ✅ Correct import
+from pydantic import BaseModel
 
 # Controlled vocabularies
 JOB_CATEGORIES = ["Engineering", "Marketing", "Product", "Design", "Operations", "Sales", "Game Launcher"]
