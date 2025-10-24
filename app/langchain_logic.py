@@ -1,5 +1,4 @@
-# langchain_logic.py
-
+import os
 import json
 import re
 from typing import List, Optional, Dict, Any
@@ -39,11 +38,9 @@ CONTROLLED LISTS
 - Job Regions: {regions}
 """
 
-# Country sets for region inference
 EU_EEA_UK_CH_NO_IS_LI = {"Hungary", "Germany", "France", "UK", "Sweden", "Netherlands", "Norway", "Ireland"}
 MIDDLE_EAST_AFRICA = {"UAE", "South Africa", "Nigeria", "Egypt", "Kenya"}
 
-# ✅ Pydantic schema for structured output
 class JobOutputSchema(BaseModel):
     company_name: str
     job_category: str
@@ -52,9 +49,9 @@ class JobOutputSchema(BaseModel):
     job_type: List[str]
     job_region: Optional[str]
 
-# LangChain model setup
-def _model():
-    return ChatOpenAI(model="gpt-4o", temperature=0).with_structured_output(JobOutputSchema)
+def _model(model_name: Optional[str] = None):
+    model_id = model_name or os.getenv("PRIMARY_MODEL", "gpt-4o")
+    return ChatOpenAI(model=model_id, temperature=0).with_structured_output(JobOutputSchema)
 
 def build_prompt(job_json: str) -> Dict[str, Any]:
     return {
@@ -118,20 +115,26 @@ def extract_job_info(job_dict: dict) -> dict:
     }
 
     prompt = ChatPromptTemplate.from_messages([("system", SYSTEM), ("user", USER_TMPL)])
-    chain = prompt | _model()
+    chain = prompt | _model(os.getenv("PRIMARY_MODEL"))
 
     try:
         result = chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
-        result_dict = result.dict()  # ✅ Fix: convert pydantic model to dict
-    except OutputParserException:
-        result_dict = {
-            "company_name": extract_company_name_heuristic(full_text),
-            "job_category": "Engineering",
-            "benefits": find_phrases(full_text, BENEFITS),
-            "job_tags": find_phrases(full_text, BENEFITS),
-            "job_type": ["full-time"],
-            "job_region": region_from_text(job_region, full_text),
-        }
+        result_dict = result.dict()
+    except Exception:
+        # Retry with fallback model
+        fallback_chain = prompt | _model(os.getenv("FALLBACK_MODEL", "gpt-4o"))
+        try:
+            result = fallback_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
+            result_dict = result.dict()
+        except Exception:
+            result_dict = {
+                "company_name": extract_company_name_heuristic(full_text),
+                "job_category": "Engineering",
+                "benefits": find_phrases(full_text, BENEFITS),
+                "job_tags": find_phrases(full_text, BENEFITS),
+                "job_type": ["full-time"],
+                "job_region": region_from_text(job_region, full_text),
+            }
 
     if detect_high_salary(full_text) and "high salary" not in result_dict["job_type"]:
         result_dict["job_type"].append("high salary")
