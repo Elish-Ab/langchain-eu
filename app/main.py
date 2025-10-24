@@ -34,6 +34,9 @@ class JobItem(BaseModel):
     job_type: Optional[str] = None
     published_within_5_days: Optional[str] = None
 
+@app.get("/")
+def health_check():
+    return {"message": "this is langchain api"}
 @app.get("/healthz")
 def health_check():
     return {"status": "ok"}
