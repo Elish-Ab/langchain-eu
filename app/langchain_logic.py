@@ -1,45 +1,62 @@
 import os
 import json
-import re
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable
 
 import backoff
 from bs4 import BeautifulSoup
-from langchain_core.exceptions import OutputParserException
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
+import re
 
-# Controlled vocabularies
-JOB_CATEGORIES = ["Engineering", "Marketing", "Product", "Design", "Operations", "Sales", "Game Launcher"]
-JOB_TYPES = ["full-time", "Part Time", "Internship", "Freelance", "Temporary", "4 day week", "AI", "German", "Multilingual", "Bilingual", "jobs in crypto", "web3", "high salary"]
-BENEFITS = ["Flexible working hours", "Health insurance", "Remote work", "Stock options", "4 day week", "Annual learning stipend"]
+# ──────────────────────────────────────────────────────────────────────────────
+# Controlled vocabularies (closed sets)
+# ──────────────────────────────────────────────────────────────────────────────
+JOB_CATEGORIES = [
+    "Engineering", "Marketing", "Product", "Design", "Operations", "Sales", "Game Launcher"
+]
+JOB_TYPES = [
+    "full-time", "Part Time", "Internship", "Freelance", "Temporary",
+    "4 day week", "AI", "German", "Multilingual", "Bilingual",
+    "jobs in crypto", "web3", "high salary"
+]
+BENEFITS = [
+    "Flexible working hours", "Health insurance", "Remote work",
+    "Stock options", "4 day week", "Annual learning stipend"
+]
 REGION_VALUES = ["Europe", "EMEA", "Worldwide"]
 
-# Prompt templates
+# ──────────────────────────────────────────────────────────────────────────────
+# Prompt (ALL fields are extracted by the LLM)
+# ──────────────────────────────────────────────────────────────────────────────
 SYSTEM = (
-    "You classify a job post into CLOSED SETS and extract the employer name.\n"
+    "You extract structured job info and classify into CLOSED SETS. "
     "Return ONLY valid JSON for the provided schema.\n"
-    "- company_name: exact employer/brand.\n"
-    "- job_category: one from list (title priority).\n"
-    "- benefits & job_tags: exact phrases from whitelist.\n"
-    "- job_type: only from list. Add 'high salary' if comp >=100k.\n"
-    "- job_region: match keywords or infer from countries.\n"
-    "Return: JSON with keys: company_name, job_category, benefits[], job_tags[], job_type[], job_region (or null)."
+    "Guidelines:\n"
+    "- company_name: exact employer/brand (plain text, no URL). If unknown, return empty string.\n"
+    "- job_category: choose ONE from Job Categories or empty string if unclear (title has priority).\n"
+    "- benefits & job_tags: choose ONLY items that EXACTLY match the Benefits whitelist (verbatim strings).\n"
+    "- job_type: choose ONLY items from the Job Types whitelist; map synonyms from hints/description "
+    "  (e.g., 'Full time'/'FT' → 'full-time'). Include multiple if explicitly present.\n"
+    "- job_region: choose ONLY ONE from Job Regions or empty string if unclear; map hints or text (e.g., 'EMEA' → 'EMEA').\n"
+    "- salary: return a normalized string based on the text: "
+    "  • convert 'k' to full numbers with thousand separators (e.g., '90k' → '90,000'); "
+    "  • keep the currency symbol/code; "
+    "  • ranges as '£90,000–£120,000'; "
+    "  • if the text is a lower bound (e.g., 'from £90k'), format as '£90,000+'; "
+    "  • drop non-monetary add-ons like '+ bonus' or 'plus benefits'. If unknown, return empty string.\n"
+    "Return JSON with keys: company_name, job_category, benefits[], job_tags[], job_type[], job_region, salary."
 )
 
-USER_TMPL = """INPUT:
+USER_TMPL = """INPUT (free text + hints):
 {job_json}
 
 CONTROLLED LISTS
 - Job Categories: {job_categories}
 - Job Types: {job_types}
-- Benefits (for tags too): {benefits}
+- Benefits (also used for job_tags): {benefits}
 - Job Regions: {regions}
 """
-
-EU_EEA_UK_CH_NO_IS_LI = {"Hungary", "Germany", "France", "UK", "Sweden", "Netherlands", "Norway", "Ireland"}
-MIDDLE_EAST_AFRICA = {"UAE", "South Africa", "Nigeria", "Egypt", "Kenya"}
 
 class JobOutputSchema(BaseModel):
     company_name: str
@@ -48,6 +65,7 @@ class JobOutputSchema(BaseModel):
     job_tags: List[str]
     job_type: List[str]
     job_region: Optional[str]
+    salary: str
 
 def _model(model_name: Optional[str] = None):
     model_id = model_name or os.getenv("PRIMARY_MODEL", "gpt-4o")
@@ -62,90 +80,203 @@ def build_prompt(job_json: str) -> Dict[str, Any]:
         "regions": REGION_VALUES,
     }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities (no extraction heuristics; only formatting/validation)
+# ──────────────────────────────────────────────────────────────────────────────
 def strip_html(html: Optional[str]) -> str:
     if not html:
         return ""
-    return re.sub(r"\s+", " ", BeautifulSoup(html, "html.parser").get_text()).strip()
+    return " ".join(BeautifulSoup(html, "html.parser").get_text().split()).strip()
 
-def detect_high_salary(text: str) -> bool:
-    if re.search(r"(?i)(\$|USD|EUR|\u20ac|GBP|\u00a3)?\s*1\s*0{2}\s*k", text):
-        return True
-    nums = [int(n.replace(",", "")) for n in re.findall(r"(?i)(\d{3,6})", text) if n.isdigit()]
-    return any(n >= 100000 for n in nums)
+def _unique_keep_order(items: Iterable[str]) -> List[str]:
+    seen, out = set(), []
+    for x in items or []:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
 
-def find_phrases(text: str, phrases: List[str]) -> List[str]:
-    found = []
-    for p in phrases:
-        if re.search(rf"(?i)(?<!\w){re.escape(p)}(?!\w)", text):
-            found.append(p)
-    return list(dict.fromkeys(found))
+def _validate_one(value: str, allowed: List[str]) -> str:
+    return value if value in allowed else ""
 
-def region_from_text(job_region: str, full_text: str) -> Optional[str]:
-    t = full_text.lower()
-    countries = set(job_region.split(", ")) if job_region else set()
-    if "worldwide" in t or "global" in t:
-        return "Worldwide"
-    if countries & EU_EEA_UK_CH_NO_IS_LI:
-        return "Europe"
-    if countries & MIDDLE_EAST_AFRICA or "emea" in t:
-        return "EMEA"
+def _validate_many(values: Iterable[str], allowed: List[str]) -> List[str]:
+    allowed_set = set(allowed)
+    return [v for v in _unique_keep_order(values or []) if v in allowed_set]
+
+def _normalize_company_shape(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return ""
+    n = n.replace("-dot-", ".").replace(" dot ", ".").replace(" dot-", ".")
+    return n[:1].upper() + n[1:]
+
+def _coerce_list(x) -> List[str]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [str(i) for i in x]
+    if isinstance(x, str) and x.strip():
+        return [x.strip()]
+    return []
+
+def _merge_results(primary: JobOutputSchema, fallback: Optional[JobOutputSchema]) -> JobOutputSchema:
+    """
+    Per-field merge: prefer primary; if empty, use fallback's value.
+    Validation happens later.
+    """
+    if fallback is None:
+        return primary
+
+    def first_non_empty(a, b) -> str:
+        return (a or "").strip() if (a or "").strip() else (b or "").strip()
+
+    return JobOutputSchema(
+        company_name=first_non_empty(primary.company_name, fallback.company_name),
+        job_category=first_non_empty(primary.job_category, fallback.job_category),
+        benefits=_coerce_list(primary.benefits) or _coerce_list(fallback.benefits),
+        job_tags=_coerce_list(primary.job_tags) or _coerce_list(fallback.job_tags),
+        job_type=_coerce_list(primary.job_type) or _coerce_list(fallback.job_type),
+        job_region=first_non_empty(primary.job_region or "", fallback.job_region or ""),
+        salary=first_non_empty(primary.salary, fallback.salary),
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Salary → "high salary" post-processing (LLM output only) — USD/EUR/GBP
+# ──────────────────────────────────────────────────────────────────────────────
+ALLOWED_HIGH_SALARY_CURRENCIES = {"USD", "EUR", "GBP"}
+
+_CURRENCY_MAP = {
+    "$": "USD", "USD": "USD", "usd": "USD",
+    "€": "EUR", "EUR": "EUR", "eur": "EUR",
+    "£": "GBP", "GBP": "GBP", "gbp": "GBP",
+}
+
+_NUM_RE = re.compile(r"\d{1,3}(?:,\d{3})+|\d{5,}")  # e.g., 90,000 or 120000
+
+def _min_amount_from_llm_salary(salary: str) -> Optional[int]:
+    """
+    Parse the LLM's normalized salary string to get the MINIMUM numeric amount
+    when currency ∈ ALLOWED_HIGH_SALARY_CURRENCIES. Returns an int or None.
+    Examples:
+      "$120,000–$150,000" → 120000
+      "€100,000+" → 100000
+      "GBP 110,000" → 110000
+      "£200,000+" → 200000
+    """
+    if not salary:
+        return None
+    s = salary.strip()
+
+    # Currency before number
+    cur_before = re.search(r"(USD|EUR|GBP|\$|€|£)\s*(" + _NUM_RE.pattern + ")", s, flags=re.I)
+    if cur_before:
+        cur_raw, num_raw = cur_before.group(1), cur_before.group(2)
+        cur = _CURRENCY_MAP.get(cur_raw, None)
+        if cur in ALLOWED_HIGH_SALARY_CURRENCIES:
+            return int(num_raw.replace(",", ""))
+
+    # Number before currency
+    num_after = re.search(r"(" + _NUM_RE.pattern + r")\s*(USD|EUR|GBP|\$|€|£)", s, flags=re.I)
+    if num_after:
+        num_raw, cur_raw = num_after.group(1), num_after.group(2)
+        cur = _CURRENCY_MAP.get(cur_raw, None)
+        if cur in ALLOWED_HIGH_SALARY_CURRENCIES:
+            return int(num_raw.replace(",", ""))
+
     return None
 
-def extract_company_name_heuristic(text: str) -> Optional[str]:
-    m = re.search(r"(?i)join (.*?) | work at (.*?) | ([A-Z][A-Za-z]+) is a ", text)
-    if m:
-        return m.group(1) or m.group(2) or m.group(3)
-    m = re.search(r"@([a-z0-9-]+)\.", text)
-    if m:
-        return m.group(1).capitalize()
-    return None
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Core
+# ──────────────────────────────────────────────────────────────────────────────
 @backoff.on_exception(backoff.expo, Exception, max_tries=3)
-def extract_job_info(job_dict: dict) -> dict:
+def extract_job_info(job_dict: dict) -> Dict[str, Any]:
+    """
+    All fields are extracted by the LLM. Python just orchestrates:
+    - call primary; if any important fields are empty, call fallback
+    - merge per-field (primary preferred; fallback fills gaps)
+    - validate against closed sets
+    - final safety fallback for company_name → provided input
+    - add 'high salary' to job_type iff LLM salary >= 100000 and currency is USD/EUR/GBP
+    """
     full_text = strip_html(job_dict.get("job_description", ""))
-    title = job_dict.get("job_title", "")
-    salary = job_dict.get("salary", "")
-    job_region = job_dict.get("job_region", "")
+    title = (job_dict.get("job_title") or "").strip()
+    salary_field = (job_dict.get("salary") or "").strip()     # hint to the LLM
+    job_region_hint = (job_dict.get("job_region") or "").strip()
+    job_type_hint = (job_dict.get("job_type") or "").strip()  # hint to the LLM
+    provided_company = (job_dict.get("company_name") or "").strip()
 
     payload = {
         "title": title,
         "description": full_text,
-        "salary": salary,
-        "job_region": job_region,
+        "salary_field": salary_field,
+        "job_region_hint": job_region_hint,
+        "job_type_hint": job_type_hint,
+        "provided_company_field": provided_company,  # context only
     }
 
     prompt = ChatPromptTemplate.from_messages([("system", SYSTEM), ("user", USER_TMPL)])
-    chain = prompt | _model(os.getenv("PRIMARY_MODEL"))
+    primary_chain = prompt | _model(os.getenv("PRIMARY_MODEL"))
+    fallback_chain = prompt | _model(os.getenv("FALLBACK_MODEL", "gpt-4o-mini"))
 
+    result_primary: Optional[JobOutputSchema] = None
     try:
-        result = chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
-        result_dict = result.dict()
+        result_primary = primary_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
     except Exception:
-        # Retry with fallback model
-        fallback_chain = prompt | _model(os.getenv("FALLBACK_MODEL", "gpt-4o"))
         try:
-            result = fallback_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
-            result_dict = result.dict()
+            result_primary = fallback_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
         except Exception:
-            result_dict = {
-                "company_name": extract_company_name_heuristic(full_text),
-                "job_category": "Engineering",
-                "benefits": find_phrases(full_text, BENEFITS),
-                "job_tags": find_phrases(full_text, BENEFITS),
-                "job_type": ["full-time"],
-                "job_region": region_from_text(job_region, full_text),
-            }
+            result_primary = JobOutputSchema(
+                company_name="", job_category="", benefits=[], job_tags=[],
+                job_type=[], job_region="", salary=""
+            )
 
-    if detect_high_salary(full_text) and "high salary" not in result_dict["job_type"]:
-        result_dict["job_type"].append("high salary")
+    # Fallback gap fill if needed
+    needs_fallback = any([
+        not (result_primary.company_name or "").strip(),
+        not (result_primary.job_category or "").strip(),
+        not (result_primary.job_region or "").strip(),
+        not _coerce_list(result_primary.benefits),
+        not _coerce_list(result_primary.job_tags),
+        not _coerce_list(result_primary.job_type),
+        not (result_primary.salary or "").strip(),
+    ])
+
+    result_merged = result_primary
+    if needs_fallback:
+        try:
+            result_fallback = fallback_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
+        except Exception:
+            result_fallback = None
+        result_merged = _merge_results(result_primary, result_fallback)
+
+    # Final safety: if company still empty, use provided field (light normalization)
+    company_final = (result_merged.company_name or "").strip()
+    if not company_final:
+        company_final = provided_company
+    company_final = _normalize_company_shape(company_final)
+
+    # Validate against closed sets
+    job_category_final = _validate_one((result_merged.job_category or "").strip(), JOB_CATEGORIES)
+    benefits_final = _validate_many(_coerce_list(result_merged.benefits), BENEFITS)
+    job_tags_final = _validate_many(_coerce_list(result_merged.job_tags), BENEFITS)
+    job_type_final = _validate_many(_coerce_list(result_merged.job_type), JOB_TYPES)
+    job_region_final = _validate_one((result_merged.job_region or "").strip(), REGION_VALUES)
+
+    # Salary from LLM (as-is)
+    salary_final = (result_merged.salary or "").strip()
+
+    # Post-processing rule: add "high salary" if min amount >= 100000 and currency is USD/EUR/GBP
+    min_amt = _min_amount_from_llm_salary(salary_final)
+    if min_amt is not None and min_amt >= 100000 and "high salary" not in job_type_final:
+        job_type_final.append("high salary")
 
     return {
-        "company_name": result_dict["company_name"],
-        "job_category": result_dict["job_category"],
-        "job_tags": ", ".join(result_dict["job_tags"]),
-        "benefits": ", ".join(result_dict["benefits"]),
-        "job_type": ", ".join(result_dict["job_type"]),
-        "job_region": result_dict["job_region"] or None
+        "company_name": company_final,
+        "job_category": job_category_final,
+        "job_tags": ", ".join(job_tags_final) if job_tags_final else "",
+        "benefits": ", ".join(benefits_final) if benefits_final else "",
+        "job_type": ", ".join(job_type_final) if job_type_final else "",
+        "job_region": job_region_final,
+        "salary": salary_final,
     }
 
 def normalize_job_post(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -153,11 +284,12 @@ def normalize_job_post(job: Dict[str, Any]) -> Dict[str, Any]:
         return extract_job_info(job)
     except Exception as e:
         return {
-            "company_name": None,
-            "job_category": None,
+            "company_name": (job.get("company_name") or "").strip(),  # last-resort echo
+            "job_category": "",
             "job_tags": "",
             "benefits": "",
             "job_type": "",
-            "job_region": None,
+            "job_region": "",
+            "salary": "",
             "error": str(e)
         }
