@@ -12,33 +12,64 @@ import re
 # ──────────────────────────────────────────────────────────────────────────────
 # Controlled vocabularies (closed sets)
 # ──────────────────────────────────────────────────────────────────────────────
+
 JOB_CATEGORIES = [
     "Engineering", "Marketing", "Product", "Design", "Operations", "Sales", "Game Launcher"
 ]
+
 JOB_TYPES = [
     "full-time", "Part Time", "Internship", "Freelance", "Temporary",
     "4 day week", "AI", "German", "Multilingual", "Bilingual",
     "jobs in crypto", "web3", "high salary"
 ]
-BENEFITS = [
-    "Flexible working hours", "Health insurance", "Remote work",
-    "Stock options", "4 day week", "Annual learning stipend"
+
+# Job Tags whitelist (as provided)
+JOB_TAGS_WHITELIST = [
+    ".NET","1-3 years","3-5 years","5+ years","agile","AI","Android","Angular","ASP.NET","Bash","BigQuery",
+    "Bilingual","Blockchain","C#","DevOps","SecOps","Django","docker","Drupal","Elixir","Entry Level","Flask",
+    "Flutter","Git","Go","Golang","GraphQL","High-Salary","iOS","Java","Javascript","jobs in crypto","jQuery",
+    "Machine Learning","MongoDB","MySQL","Next.js","Node","node.js","noSQL","PHP","PostgreSQL","Python","R",
+    "Rails","React","react native","Reactjs","Redux","Rust","Scala","Snowflake","Solidity","Spark","SQL",
+    "Swift","Tableau","Tailwind","Terraform","Typescript","Ubutu","vue","vue.js","web3","WordPress",
+    "work from anywhere ","Visa support","Relocation support","company off-sites","home-office budget",
+    "Fertility benefits","coworking budget","wellbeing allowance","professional development budget",
+    "mental health support","parental leave","Health insurance","Unlimited Time Off","Childcare support",
+    "Flexible Schedule","Equity","Kubernetes","Linux","Ruby","Ruby on Rails","high-salary"
 ]
-REGION_VALUES = ["Europe", "EMEA", "Worldwide"]
+
+# Job Benefits whitelist (as provided)
+BENEFITS_WHITELIST = [
+    "home-office budget","Fertility benefits","company retreats","4 day work week ",
+    "coworking budget","wellbeing allowance","professional development allowance",
+    "mental health support","parental leave","Health insurance","Unlimited Time Off",
+    "Childcare support","Flexible Schedule","Equity / Stocks","work from anywhere policy"
+]
+
+# Region whitelist (as provided)
+REGION_VALUES = [
+    "Worldwide","EMEA","Africa","Ghana","Kenya","Egypt","South Africa","Europe","Armenia","Austria","Belgium",
+    "Bulgaria","Croatia","Cyprus","Czechia","Denmark","Estonia","Finland","France","Germany","Greece","Hungary",
+    "Iceland","Ireland","Italy","Latvia","Lithuania","Luxembourg","Macedonia","Malta","Netherlands","Norway",
+    "Portugal","Poland","Romania","Serbia","Slovakia","Slovenia","Spain","Switzerland","Sweden","Turkey",
+    "Ukraine","UK","Georgia","UAE","India","LATAM","Argentina","Brazil","Colombia","AMER","Canada","US",
+    "Mexico","APAC","Singapore","Australia","Asia"
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt (ALL fields are extracted by the LLM)
 # ──────────────────────────────────────────────────────────────────────────────
+
 SYSTEM = (
     "You extract structured job info and classify into CLOSED SETS. "
     "Return ONLY valid JSON for the provided schema.\n"
     "Guidelines:\n"
     "- company_name: exact employer/brand (plain text, no URL). If unknown, return empty string.\n"
     "- job_category: choose ONE from Job Categories or empty string if unclear (title has priority).\n"
-    "- benefits & job_tags: choose ONLY items that EXACTLY match the Benefits whitelist (verbatim strings).\n"
+    "- job_tags: choose ONLY items that EXACTLY match the Job Tags whitelist (verbatim strings).\n"
+    "- benefits: choose ONLY items that EXACTLY match the Job Benefits whitelist (verbatim strings).\n"
     "- job_type: choose ONLY items from the Job Types whitelist; map synonyms from hints/description "
     "  (e.g., 'Full time'/'FT' → 'full-time'). Include multiple if explicitly present.\n"
-    "- job_region: choose ONLY ONE from Job Regions or empty string if unclear; map hints or text (e.g., 'EMEA' → 'EMEA').\n"
+    "- job_region: choose ONLY ONE from Job Regions or empty string if unclear; map hints or text.\n"
     "- salary: return a normalized string based on the text: "
     "  • convert 'k' to full numbers with thousand separators (e.g., '90k' → '90,000'); "
     "  • keep the currency symbol/code; "
@@ -54,7 +85,8 @@ USER_TMPL = """INPUT (free text + hints):
 CONTROLLED LISTS
 - Job Categories: {job_categories}
 - Job Types: {job_types}
-- Benefits (also used for job_tags): {benefits}
+- Job Tags: {job_tags}
+- Job Benefits: {benefits}
 - Job Regions: {regions}
 """
 
@@ -76,13 +108,15 @@ def build_prompt(job_json: str) -> Dict[str, Any]:
         "job_json": job_json,
         "job_categories": JOB_CATEGORIES,
         "job_types": JOB_TYPES,
-        "benefits": BENEFITS,
+        "job_tags": JOB_TAGS_WHITELIST,
+        "benefits": BENEFITS_WHITELIST,
         "regions": REGION_VALUES,
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities (no extraction heuristics; only formatting/validation)
 # ──────────────────────────────────────────────────────────────────────────────
+
 def strip_html(html: Optional[str]) -> str:
     if not html:
         return ""
@@ -106,8 +140,24 @@ def _normalize_company_shape(name: str) -> str:
     n = (name or "").strip()
     if not n:
         return ""
+    # very light normalization only (no guessing/extraction)
     n = n.replace("-dot-", ".").replace(" dot ", ".").replace(" dot-", ".")
     return n[:1].upper() + n[1:]
+
+def _company_is_valid(name: str) -> bool:
+    """
+    Basic sanity for company_name without 'extracting':
+    - non-empty, <= 100 chars
+    - contains at least one letter
+    - does not look like a sentence fragment (endswith common verbs/punctuation)
+    """
+    if not name: return False
+    n = name.strip()
+    if not n or len(n) > 100: return False
+    if not re.search(r"[A-Za-z]", n): return False
+    bad_endings = (" are", " is", " we", " hiring", " expanding", " growing", ":", ";")
+    if any(n.lower().endswith(b) for b in bad_endings): return False
+    return True
 
 def _coerce_list(x) -> List[str]:
     if x is None:
@@ -142,6 +192,7 @@ def _merge_results(primary: JobOutputSchema, fallback: Optional[JobOutputSchema]
 # ──────────────────────────────────────────────────────────────────────────────
 # Salary → "high salary" post-processing (LLM output only) — USD/EUR/GBP
 # ──────────────────────────────────────────────────────────────────────────────
+
 ALLOWED_HIGH_SALARY_CURRENCIES = {"USD", "EUR", "GBP"}
 
 _CURRENCY_MAP = {
@@ -194,7 +245,7 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
     - call primary; if any important fields are empty, call fallback
     - merge per-field (primary preferred; fallback fills gaps)
     - validate against closed sets
-    - final safety fallback for company_name → provided input
+    - company_name must be valid; if both models fail, use provided input
     - add 'high salary' to job_type iff LLM salary >= 100000 and currency is USD/EUR/GBP
     """
     full_text = strip_html(job_dict.get("job_description", ""))
@@ -248,16 +299,16 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
             result_fallback = None
         result_merged = _merge_results(result_primary, result_fallback)
 
-    # Final safety: if company still empty, use provided field (light normalization)
+    # Company: must be valid; else fall back to provided field
     company_final = (result_merged.company_name or "").strip()
-    if not company_final:
-        company_final = provided_company
+    if not _company_is_valid(company_final):
+        company_final = provided_company.strip()
     company_final = _normalize_company_shape(company_final)
 
     # Validate against closed sets
     job_category_final = _validate_one((result_merged.job_category or "").strip(), JOB_CATEGORIES)
-    benefits_final = _validate_many(_coerce_list(result_merged.benefits), BENEFITS)
-    job_tags_final = _validate_many(_coerce_list(result_merged.job_tags), BENEFITS)
+    benefits_final = _validate_many(_coerce_list(result_merged.benefits), BENEFITS_WHITELIST)
+    job_tags_final = _validate_many(_coerce_list(result_merged.job_tags), JOB_TAGS_WHITELIST)
     job_type_final = _validate_many(_coerce_list(result_merged.job_type), JOB_TYPES)
     job_region_final = _validate_one((result_merged.job_region or "").strip(), REGION_VALUES)
 
