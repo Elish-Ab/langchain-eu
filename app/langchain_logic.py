@@ -14,8 +14,9 @@ import re
 # ──────────────────────────────────────────────────────────────────────────────
 
 JOB_CATEGORIES = [
-    "Engineering", "Marketing", "Product", "Design", "Operations", "Sales", "Game Launcher"
+    "Admin & Operations","Customer Support","Data","Design","Engineering","Finance","Human Resources","IT","Legal","Marketing","Product","Sales","All Others"
 ]
+
 
 JOB_TYPES = [
     "full-time", "Part Time", "Internship", "Freelance", "Temporary",
@@ -69,7 +70,7 @@ SYSTEM = (
     "- benefits: choose ONLY items that EXACTLY match the Job Benefits whitelist (verbatim strings).\n"
     "- job_type: choose ONLY items from the Job Types whitelist; map synonyms from hints/description "
     "  (e.g., 'Full time'/'FT' → 'full-time'). Include multiple if explicitly present.\n"
-    "- job_region: choose ONLY ONE from Job Regions or empty string if unclear; map hints or text.\n"
+    "- job_region: choose ONE OR MORE from Job Regions (if multiple regions are explicitly mentioned); otherwise empty string.map hints or text.\n"
     "- salary: return a normalized string based on the text: "
     "  • convert 'k' to full numbers with thousand separators (e.g., '90k' → '90,000'); "
     "  • keep the currency symbol/code; "
@@ -96,7 +97,7 @@ class JobOutputSchema(BaseModel):
     benefits: List[str]
     job_tags: List[str]
     job_type: List[str]
-    job_region: Optional[str]
+    job_region: List[str]
     salary: str
 
 def _model(model_name: Optional[str] = None):
@@ -185,7 +186,7 @@ def _merge_results(primary: JobOutputSchema, fallback: Optional[JobOutputSchema]
         benefits=_coerce_list(primary.benefits) or _coerce_list(fallback.benefits),
         job_tags=_coerce_list(primary.job_tags) or _coerce_list(fallback.job_tags),
         job_type=_coerce_list(primary.job_type) or _coerce_list(fallback.job_type),
-        job_region=first_non_empty(primary.job_region or "", fallback.job_region or ""),
+        job_region=_coerce_list(primary.job_region) or _coerce_list(fallback.job_region),
         salary=first_non_empty(primary.salary, fallback.salary),
     )
 
@@ -310,7 +311,7 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
     benefits_final = _validate_many(_coerce_list(result_merged.benefits), BENEFITS_WHITELIST)
     job_tags_final = _validate_many(_coerce_list(result_merged.job_tags), JOB_TAGS_WHITELIST)
     job_type_final = _validate_many(_coerce_list(result_merged.job_type), JOB_TYPES)
-    job_region_final = _validate_one((result_merged.job_region or "").strip(), REGION_VALUES)
+    job_region_final = _validate_many(_coerce_list(result_merged.job_region), REGION_VALUES)
 
     # Salary from LLM (as-is)
     salary_final = (result_merged.salary or "").strip()
@@ -326,7 +327,7 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
         "job_tags": ", ".join(job_tags_final) if job_tags_final else "",
         "benefits": ", ".join(benefits_final) if benefits_final else "",
         "job_type": ", ".join(job_type_final) if job_type_final else "",
-        "job_region": job_region_final,
+        "job_region": ", ".join(job_region_final) if job_region_final else "",
         "salary": salary_final,
     }
 
