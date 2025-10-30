@@ -181,14 +181,15 @@ def _merge_results(primary: JobOutputSchema, fallback: Optional[JobOutputSchema]
         return (a or "").strip() if (a or "").strip() else (b or "").strip()
 
     return JobOutputSchema(
-        company_name=first_non_empty(primary.company_name, fallback.company_name),
-        job_category=first_non_empty(primary.job_category, fallback.job_category),
-        benefits=_coerce_list(primary.benefits) or _coerce_list(fallback.benefits),
-        job_tags=_coerce_list(primary.job_tags) or _coerce_list(fallback.job_tags),
-        job_type=_coerce_list(primary.job_type) or _coerce_list(fallback.job_type),
-        job_region=_coerce_list(primary.job_region) or _coerce_list(fallback.job_region),
-        salary=first_non_empty(primary.salary, fallback.salary),
-    )
+    company_name=first_non_empty(primary.company_name, fallback.company_name),
+    job_category=first_non_empty(primary.job_category, fallback.job_category),
+    benefits=_coerce_list(primary.benefits) or _coerce_list(fallback.benefits),
+    job_tags=_coerce_list(primary.job_tags) or _coerce_list(fallback.job_tags),
+    job_type=_coerce_list(primary.job_type) or _coerce_list(fallback.job_type),
+    job_region=_coerce_list(primary.job_region) or _coerce_list(fallback.job_region), 
+    salary=first_non_empty(primary.salary, fallback.salary),
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Salary → "high salary" post-processing (LLM output only) — USD/EUR/GBP
@@ -249,11 +250,27 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
     - company_name must be valid; if both models fail, use provided input
     - add 'high salary' to job_type iff LLM salary >= 100000 and currency is USD/EUR/GBP
     """
+    # ─────────────────────────────────────────────────────────────
+    # Preprocess input fields safely (handle both str & list)
+    # ─────────────────────────────────────────────────────────────
     full_text = strip_html(job_dict.get("job_description", ""))
     title = (job_dict.get("job_title") or "").strip()
-    salary_field = (job_dict.get("salary") or "").strip()     # hint to the LLM
-    job_region_hint = (job_dict.get("job_region") or "").strip()
-    job_type_hint = (job_dict.get("job_type") or "").strip()  # hint to the LLM
+    salary_field = (job_dict.get("salary") or "").strip()  # hint to the LLM
+
+    # Handle job_region (can be str or list)
+    _job_region_raw = job_dict.get("job_region", "")
+    if isinstance(_job_region_raw, list):
+        job_region_hint = ", ".join([str(r).strip() for r in _job_region_raw if str(r).strip()])
+    else:
+        job_region_hint = str(_job_region_raw).strip()
+
+    # Handle job_type (can be str or list)
+    _job_type_raw = job_dict.get("job_type", "")
+    if isinstance(_job_type_raw, list):
+        job_type_hint = ", ".join([str(t).strip() for t in _job_type_raw if str(t).strip()])
+    else:
+        job_type_hint = str(_job_type_raw).strip()
+
     provided_company = (job_dict.get("company_name") or "").strip()
 
     payload = {
@@ -265,6 +282,9 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
         "provided_company_field": provided_company,  # context only
     }
 
+    # ─────────────────────────────────────────────────────────────
+    # Build prompt and model chains
+    # ─────────────────────────────────────────────────────────────
     prompt = ChatPromptTemplate.from_messages([("system", SYSTEM), ("user", USER_TMPL)])
     primary_chain = prompt | _model(os.getenv("PRIMARY_MODEL"))
     fallback_chain = prompt | _model(os.getenv("FALLBACK_MODEL", "gpt-4o-mini"))
@@ -278,14 +298,16 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
         except Exception:
             result_primary = JobOutputSchema(
                 company_name="", job_category="", benefits=[], job_tags=[],
-                job_type=[], job_region="", salary=""
+                job_type=[], job_region=[], salary=""
             )
 
+    # ─────────────────────────────────────────────────────────────
     # Fallback gap fill if needed
+    # ─────────────────────────────────────────────────────────────
     needs_fallback = any([
         not (result_primary.company_name or "").strip(),
         not (result_primary.job_category or "").strip(),
-        not (result_primary.job_region or "").strip(),
+        not _coerce_list(result_primary.job_region),  # ✅ FIXED: no .strip()
         not _coerce_list(result_primary.benefits),
         not _coerce_list(result_primary.job_tags),
         not _coerce_list(result_primary.job_type),
@@ -300,27 +322,36 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
             result_fallback = None
         result_merged = _merge_results(result_primary, result_fallback)
 
-    # Company: must be valid; else fall back to provided field
+    # ─────────────────────────────────────────────────────────────
+    # Company normalization and fallback
+    # ─────────────────────────────────────────────────────────────
     company_final = (result_merged.company_name or "").strip()
     if not _company_is_valid(company_final):
         company_final = provided_company.strip()
     company_final = _normalize_company_shape(company_final)
 
-    # Validate against closed sets
+    # ─────────────────────────────────────────────────────────────
+    # Validate against closed sets (multi-region support)
+    # ─────────────────────────────────────────────────────────────
     job_category_final = _validate_one((result_merged.job_category or "").strip(), JOB_CATEGORIES)
     benefits_final = _validate_many(_coerce_list(result_merged.benefits), BENEFITS_WHITELIST)
     job_tags_final = _validate_many(_coerce_list(result_merged.job_tags), JOB_TAGS_WHITELIST)
     job_type_final = _validate_many(_coerce_list(result_merged.job_type), JOB_TYPES)
     job_region_final = _validate_many(_coerce_list(result_merged.job_region), REGION_VALUES)
 
-    # Salary from LLM (as-is)
+    # ─────────────────────────────────────────────────────────────
+    # Salary post-processing
+    # ─────────────────────────────────────────────────────────────
     salary_final = (result_merged.salary or "").strip()
 
-    # Post-processing rule: add "high salary" if min amount >= 100000 and currency is USD/EUR/GBP
+    # Add "high salary" if min >= 100k in USD/EUR/GBP
     min_amt = _min_amount_from_llm_salary(salary_final)
     if min_amt is not None and min_amt >= 100000 and "high salary" not in job_type_final:
         job_type_final.append("high salary")
 
+    # ─────────────────────────────────────────────────────────────
+    # Return normalized structured result
+    # ─────────────────────────────────────────────────────────────
     return {
         "company_name": company_final,
         "job_category": job_category_final,
@@ -330,6 +361,7 @@ def extract_job_info(job_dict: dict) -> Dict[str, Any]:
         "job_region": ", ".join(job_region_final) if job_region_final else "",
         "salary": salary_final,
     }
+
 
 def normalize_job_post(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
