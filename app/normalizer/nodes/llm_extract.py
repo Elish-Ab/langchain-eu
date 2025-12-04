@@ -36,39 +36,35 @@ def node_llm_extract(state: JobState) -> JobState:
     primary_chain = prompt | _model(os.getenv("PRIMARY_MODEL"))
     fallback_chain = prompt | _model(os.getenv("FALLBACK_MODEL", "gpt-4o-mini"))
 
+    def empty_schema() -> JobOutputSchema:
+        return JobOutputSchema(
+            company_name="",
+            company_website="",
+            job_category="",
+            benefits=[],
+            job_tags=[],
+            job_type=[],
+            job_region=[],
+            salary="",
+        )
+
     result_primary: Optional[JobOutputSchema] = None
     try:
         result_primary = primary_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
     except Exception:
         result_primary = None
 
+    result_fallback: Optional[JobOutputSchema] = None
+    result_merged: JobOutputSchema
+
     if result_primary is None:
-        try:
-            result_primary = fallback_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
-        except Exception:
-            result_primary = JobOutputSchema(
-                company_name="", company_website="", job_category="", benefits=[], job_tags=[],
-                job_type=[], job_region=[], salary=""
-            )
-
-    needs_fallback = any([
-        not (result_primary.company_name or "").strip(),
-        not (result_primary.job_category or "").strip(),
-        not coerce_list(result_primary.job_region),
-        not coerce_list(result_primary.benefits),
-        not coerce_list(result_primary.job_tags),
-        not coerce_list(result_primary.job_type),
-        not (result_primary.salary or "").strip(),
-    ])
-
-    result_merged = result_primary
-    result_fallback = None
-    if needs_fallback:
         try:
             result_fallback = fallback_chain.invoke(build_prompt(json.dumps(payload, ensure_ascii=False)))
         except Exception:
             result_fallback = None
-        result_merged = merge_results(result_primary, result_fallback)
+        result_merged = result_fallback or empty_schema()
+    else:
+        result_merged = result_primary
 
     return {
         **state,
