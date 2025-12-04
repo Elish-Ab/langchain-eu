@@ -1,12 +1,13 @@
+# app/langchain_logic.py
 import os
 import json
 from typing import List, Optional, Dict, Any, Iterable
 
-import backoff
+import backoff #type: ignore
 from bs4 import BeautifulSoup
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from langchain_core.prompts import ChatPromptTemplate #type: ignore
+from langchain_openai import ChatOpenAI #type: ignore
+from pydantic import BaseModel #type: ignore
 import re
 
 # ──────────────────────────────────────────────────────────────────────────────
