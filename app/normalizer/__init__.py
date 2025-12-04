@@ -11,6 +11,7 @@ def _finalize_response(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_job_post(job: dict, *, job_graph_override: Any | None = None) -> dict:
+
     """
     Public entrypoint used by FastAPI.
     """
@@ -21,7 +22,18 @@ def normalize_job_post(job: dict, *, job_graph_override: Any | None = None) -> d
 
     state = job_graph_override.invoke({"job_dict": job})
     return _finalize_response(state)
-=======
+    """
+    Public entrypoint used by FastAPI.
+    """
+    if job_graph_override is None:
+        from .graph import job_graph
+
+        job_graph_override = job_graph
+
+    state = job_graph_override.invoke({"job_dict": job})
+    return _finalize_response(state)
+  
+  
 def normalize_job_post(job: dict) -> dict:
     """
     Public entrypoint used by FastAPI.
@@ -29,3 +41,4 @@ def normalize_job_post(job: dict) -> dict:
     from .graph import job_graph
 
     return job_graph.invoke({"job_dict": job})
+
