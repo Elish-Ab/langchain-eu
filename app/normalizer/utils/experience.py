@@ -1,4 +1,5 @@
-from typing import List
+# app/normalizer/utils/experience.py
+from typing import List, Tuple
 
 EXPERIENCE_TAG_TO_LEVEL = {
     "1-3 years": "junior",
@@ -26,3 +27,17 @@ def derive_experience_level(job_tags: List[str]) -> str:
         return ""
 
     return max(levels, key=lambda l: _PRIORITY[l])
+
+
+def split_tags_and_experience(job_tags: List[str]) -> Tuple[List[str], str]:
+    """
+    Returns:
+      cleaned_tags: tags with experience tags removed
+      experience_level: derived level (junior/mid-level/senior or "")
+    """
+    exp_tags = set(EXPERIENCE_TAG_TO_LEVEL.keys())
+
+    experience_level = derive_experience_level(job_tags)
+    cleaned_tags = [t for t in job_tags if t not in exp_tags]
+
+    return cleaned_tags, experience_level
