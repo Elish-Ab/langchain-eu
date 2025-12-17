@@ -1,3 +1,4 @@
+# app/normalizer/vocab/benefits.py
 BENEFITS_WHITELIST = [
     "home-office budget","Fertility benefits","company retreats","4 day work week ",
     "coworking budget","wellbeing allowance","professional development allowance",
